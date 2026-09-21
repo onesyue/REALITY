@@ -212,30 +212,27 @@ func Server(ctx context.Context, conn net.Conn, config *Config) (*Conn, error) {
 			if copying || err != nil || hs.c.vers != VersionTLS13 || !config.ServerNames[hs.clientHello.serverName] {
 				break
 			}
-			var peerPub, peerPub2 []byte
+			// [YUE] Reverts only upstream 8cdf7bf9, which rejects every ClientHello
+			// without an X25519MLKEM768 key share. Default mihomo/YueLink, Clash
+			// Meta and uTLS *_120/ios fingerprints send a classical X25519 share
+			// only, so that check locks them out of every REALITY node. The
+			// selection below is exactly the pre-8cdf7bf9 logic (e1986a4d): prefer
+			// a classical X25519 share, else the X25519 half of X25519MLKEM768.
+			// Every other change of the Go 1.27 TLS sync (#30) is kept.
+			var peerPub []byte
 			for _, keyShare := range hs.clientHello.keyShares {
-				if keyShare.group == X25519MLKEM768 && len(keyShare.data) == mlkem.EncapsulationKeySize768+32 {
-					if peerPub2 != nil {
-						peerPub2 = nil // ensure fail
-						break // ensure once
-					}
-					peerPub2 = keyShare.data[mlkem.EncapsulationKeySize768:]
-					continue // fast continue
-				}
 				if keyShare.group == X25519 && len(keyShare.data) == 32 {
-					if peerPub != nil {
-						peerPub2 = nil // ensure fail
-						break // ensure once
-					}
 					peerPub = keyShare.data
-					break // ensure order
+					break
 				}
-			}
-			if peerPub2 == nil {
-				break // reject outdated/strange Client Hello that doesn't have X25519MLKEM768 before optional X25519
 			}
 			if peerPub == nil {
-				peerPub = peerPub2 // secondary choice: X25519 in X25519MLKEM768
+				for _, keyShare := range hs.clientHello.keyShares {
+					if keyShare.group == X25519MLKEM768 && len(keyShare.data) == mlkem.EncapsulationKeySize768+32 {
+						peerPub = keyShare.data[mlkem.EncapsulationKeySize768:]
+						break
+					}
+				}
 			}
 			for peerPub != nil {
 				if hs.c.AuthKey, err = curve25519.X25519(config.PrivateKey, peerPub); err != nil {
