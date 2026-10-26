@@ -62,6 +62,19 @@ type CloseWriteConn interface {
 	CloseWrite() error
 }
 
+// tryCloseWrite preserves reverse traffic when the connection supports half-close.
+// Closing a connection without that capability is reserved for the download side,
+// where it also releases the waiting upload copy.
+func tryCloseWrite(c net.Conn, forceCloseOnFail bool) error {
+	if conn, ok := c.(CloseWriteConn); ok {
+		return conn.CloseWrite()
+	}
+	if forceCloseOnFail {
+		return c.Close()
+	}
+	return nil
+}
+
 type MirrorConn struct {
 	*sync.Mutex
 	net.Conn
@@ -184,7 +197,7 @@ func Server(ctx context.Context, conn net.Conn, config *Config) (*Conn, error) {
 	if pc, ok := conn.(*proxyproto.Conn); ok {
 		raw = pc.Raw() // for TCP splicing in io.Copy()
 	}
-	underlying := raw.(CloseWriteConn) // *net.TCPConn or *net.UnixConn
+	underlying := raw // TCP, Unix, or a transport wrapper without CloseWrite.
 
 	mutex := new(sync.Mutex)
 
@@ -205,11 +218,12 @@ func Server(ctx context.Context, conn net.Conn, config *Config) (*Conn, error) {
 	waitGroup := new(sync.WaitGroup)
 	waitGroup.Add(2)
 
+	var clientHelloReadErr error
 	go func() {
 		for {
 			mutex.Lock()
-			hs.clientHello, _, err = hs.c.readClientHello(context.Background()) // TODO: Change some rules in this function.
-			if copying || err != nil || hs.c.vers != VersionTLS13 || !config.ServerNames[hs.clientHello.serverName] {
+			hs.clientHello, _, clientHelloReadErr = hs.c.readClientHello(context.Background()) // TODO: Change some rules in this function.
+			if copying || clientHelloReadErr != nil || hs.c.vers != VersionTLS13 || !config.ServerNames[hs.clientHello.serverName] {
 				break
 			}
 			// [YUE] Reverts only upstream 8cdf7bf9, which rejects every ClientHello
@@ -283,10 +297,7 @@ func Server(ctx context.Context, conn net.Conn, config *Config) (*Conn, error) {
 			_, err := io.Copy(target, NewRatelimitedConn(underlying, &config.LimitFallbackUpload))
 			// close target writer when received FIN (err==nil)
 			if err == nil {
-				targetWriterCloser, ok := target.(CloseWriteConn)
-				if ok {
-					targetWriterCloser.CloseWrite()
-				}
+				tryCloseWrite(target, false)
 			} else {
 				// Close target when encountering RST (or any other errors)
 				target.Close()
@@ -447,11 +458,15 @@ func Server(ctx context.Context, conn net.Conn, config *Config) (*Conn, error) {
 				}()
 			}
 			conn.Write(s2cSaved)
-			io.Copy(underlying, NewRatelimitedConn(target, &config.LimitFallbackDownload))
+			_, err := io.Copy(underlying, NewRatelimitedConn(target, &config.LimitFallbackDownload))
 			// Here is bidirectional direct forwarding:
 			// client ---underlying--- server ---target--- dest
-			// Call `underlying.CloseWrite()` once `io.Copy()` returned
-			underlying.CloseWrite()
+			// Preserve reverse traffic after clean EOF; release it after a copy error.
+			if err == nil {
+				tryCloseWrite(underlying, true)
+			} else {
+				underlying.Close()
+			}
 		}
 		waitGroup.Done()
 	}()
@@ -468,7 +483,7 @@ func Server(ctx context.Context, conn net.Conn, config *Config) (*Conn, error) {
 	conn.Close()
 	var failureReason string
 	if hs.clientHello == nil {
-		failureReason = "failed to read client hello"
+		failureReason = fmt.Sprintf("failed to read client hello: %v", clientHelloReadErr)
 	} else if hs.c.vers != VersionTLS13 {
 		failureReason = fmt.Sprintf("unsupported TLS version: %x", hs.c.vers)
 	} else if !config.ServerNames[hs.clientHello.serverName] {
